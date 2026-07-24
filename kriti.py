@@ -8,9 +8,37 @@ Ollama: OLLAMA_ORIGINS=* ollama serve (in a separate terminal)
 import json, os, sys, datetime, textwrap, requests, subprocess, shutil, threading, time, re
 from blessed import Terminal
 
+# ── RAG layer (optional — graceful degradation if kriti_rag.py missing) ───────
+try:
+    import kriti_rag
+    _RAG_AVAILABLE = True
+except ImportError:
+    _RAG_AVAILABLE = False
+
+# ── Personas layer (optional — graceful degradation) ──────────────────────────
+try:
+    import kriti_personas
+    _PERSONAS_AVAILABLE = True
+except ImportError:
+    _PERSONAS_AVAILABLE = False
+
+# ── Scheduler layer (optional — graceful degradation) ──────────────────────
+try:
+    import kriti_scheduler
+    _SCHEDULER_AVAILABLE = True
+except ImportError:
+    _SCHEDULER_AVAILABLE = False
+
+# ── Web search layer (optional — graceful degradation) ────────────────────────
+try:
+    import kriti_websearch
+    _WEBSEARCH_AVAILABLE = True
+except ImportError:
+    _WEBSEARCH_AVAILABLE = False
+
 # ── Voice layer ───────────────────────────────────────────────────────────────
 # TTS:  pyttsx3 (cross-platform). pip install pyttsx3
-#       macOS also tries `say -v Rishi` first (zero deps, better quality).
+#       macOS also tries `say -v Tara` first (zero deps, better quality).
 # STT:  pyaudio + SpeechRecognition.
 #         macOS:   pip install pyaudio SpeechRecognition  (macOS: brew install portaudio first)
 #         Windows: pip install pyaudio SpeechRecognition  (no brew needed)
@@ -34,7 +62,7 @@ def _tts_say(text):
         return
     # macOS: `say` with Indian English voice (built-in, zero deps)
     if _PLATFORM == "Darwin" and shutil.which("say"):
-        subprocess.run(["say", "-v", "Rishi", "-r", "200", clean],
+        subprocess.run(["say", "-v", "Tara", "-r", "200", clean],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return
     # Windows / Linux / macOS fallback: pyttsx3
@@ -61,6 +89,129 @@ def speak(text):
         t.start()
         return t
     return None
+
+# ── System perception ─────────────────────────────────────────────────────────
+# Gives Kriti read-only awareness of the machine: battery, CPU/RAM, foreground
+# app, volume, network. Cross-platform where possible; macOS gets the richest
+# data via osascript. Everything here is READ-ONLY — no side effects.
+
+_psutil_available = False
+try:
+    import psutil
+    _psutil_available = True
+except ImportError:
+    pass
+
+def _get_foreground_app():
+    """Name of the frontmost application. macOS only (osascript); else None."""
+    if _PLATFORM != "Darwin":
+        return None
+    try:
+        script = 'tell application "System Events" to get name of first application process whose frontmost is true'
+        out = subprocess.run(["osascript", "-e", script],
+                              capture_output=True, text=True, timeout=3)
+        name = out.stdout.strip()
+        return name or None
+    except Exception:
+        return None
+
+def _get_battery():
+    """(percent, plugged_in) or (None, None) if unavailable."""
+    if _psutil_available:
+        try:
+            b = psutil.sensors_battery()
+            if b:
+                return round(b.percent), b.power_plugged
+        except Exception:
+            pass
+    # macOS fallback via pmset
+    if _PLATFORM == "Darwin":
+        try:
+            out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=3)
+            m = re.search(r'(\d+)%', out.stdout)
+            plugged = "AC Power" in out.stdout
+            if m:
+                return int(m.group(1)), plugged
+        except Exception:
+            pass
+    return None, None
+
+def _get_cpu_ram():
+    """(cpu_percent, ram_percent) or (None, None)."""
+    if _psutil_available:
+        try:
+            cpu = psutil.cpu_percent(interval=0.3)
+            ram = psutil.virtual_memory().percent
+            return round(cpu), round(ram)
+        except Exception:
+            pass
+    return None, None
+
+def _get_volume():
+    """System volume 0-100, or None."""
+    if _PLATFORM == "Darwin":
+        try:
+            out = subprocess.run(["osascript", "-e", "output volume of (get volume settings)"],
+                                  capture_output=True, text=True, timeout=3)
+            return int(out.stdout.strip())
+        except Exception:
+            return None
+    return None
+
+def _get_wifi_ssid():
+    """Current WiFi network name, or None."""
+    if _PLATFORM == "Darwin":
+        try:
+            out = subprocess.run(
+                ["networksetup", "-getairportnetwork", "en0"],
+                capture_output=True, text=True, timeout=3)
+            if ":" in out.stdout:
+                return out.stdout.split(":", 1)[1].strip()
+        except Exception:
+            pass
+    return None
+
+def _get_disk_free():
+    """Free disk space in GB on home volume, or None."""
+    try:
+        usage = shutil.disk_usage(os.path.expanduser("~"))
+        return round(usage.free / (1024 ** 3), 1)
+    except Exception:
+        return None
+
+def get_system_status():
+    """Snapshot of machine state. Returns a dict; missing fields are None."""
+    battery_pct, plugged = _get_battery()
+    cpu, ram = _get_cpu_ram()
+    return {
+        "platform":       _PLATFORM,
+        "foreground_app": _get_foreground_app(),
+        "battery_pct":    battery_pct,
+        "plugged_in":     plugged,
+        "cpu_pct":        cpu,
+        "ram_pct":        ram,
+        "volume":         _get_volume(),
+        "wifi":           _get_wifi_ssid(),
+        "disk_free_gb":   _get_disk_free(),
+    }
+
+def format_system_status(status):
+    """Human-readable one-block summary for Kriti's live context."""
+    lines = []
+    if status.get("foreground_app"):
+        lines.append(f"- Currently in: {status['foreground_app']}")
+    if status.get("battery_pct") is not None:
+        plug = "charging" if status.get("plugged_in") else "on battery"
+        lines.append(f"- Battery: {status['battery_pct']}% ({plug})")
+    if status.get("cpu_pct") is not None:
+        lines.append(f"- CPU: {status['cpu_pct']}%  ·  RAM: {status['ram_pct']}%")
+    if status.get("volume") is not None:
+        lines.append(f"- Volume: {status['volume']}%")
+    if status.get("wifi"):
+        lines.append(f"- WiFi: {status['wifi']}")
+    if status.get("disk_free_gb") is not None:
+        lines.append(f"- Disk free: {status['disk_free_gb']} GB")
+    return "\n".join(lines) if lines else "- (system status unavailable on this platform)"
 
 # ── Sound effects & notifications ─────────────────────────────────────────────
 
@@ -341,6 +492,133 @@ def _listen_mic_sr_fallback(timeout=12, phrase_limit=45):
 
 SAVE_DIR  = os.path.expanduser("~/.life_missions")
 SAVE_FILE = os.path.join(SAVE_DIR, "global.json")   # wishlist, fund, settings
+WHITELIST_FILE = os.path.join(SAVE_DIR, "whitelist.json")
+
+# ── Action whitelist ──────────────────────────────────────────────────────────
+# Kriti can ONLY trigger apps/scripts that are explicitly listed here. She can
+# never invent a shell command or run anything outside this file. You edit
+# this list yourself (directly, or via Settings → Manage Whitelist).
+#
+# apps:    {"name": "Visual Studio Code"}  — must be the exact macOS app name
+# scripts: {"name": "backup_prier", "path": "/Users/tanish/scripts/backup.sh"}
+#          path must be an absolute path to a file that already exists.
+
+DEFAULT_WHITELIST = {
+    "apps": [
+        {"name": "Visual Studio Code"},
+        {"name": "Spotify"},
+        {"name": "Terminal"},
+    ],
+    "scripts": []
+}
+
+def load_whitelist():
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    if os.path.exists(WHITELIST_FILE):
+        try:
+            with open(WHITELIST_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    save_whitelist(DEFAULT_WHITELIST)
+    return dict(DEFAULT_WHITELIST)
+
+def save_whitelist(wl):
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    with open(WHITELIST_FILE, "w") as f:
+        json.dump(wl, f, indent=2)
+
+def whitelisted_app_names(wl):
+    return [a["name"] for a in wl.get("apps", [])]
+
+def whitelisted_script_names(wl):
+    return [s["name"] for s in wl.get("scripts", [])]
+
+def find_script(wl, name):
+    for s in wl.get("scripts", []):
+        if s["name"].lower() == name.lower():
+            return s
+    return None
+
+# ── Whitelisted action execution ──────────────────────────────────────────────
+# These are the ONLY system side-effects Kriti can trigger. Each function
+# validates against the whitelist before doing anything. No raw shell strings
+# from the LLM ever reach subprocess — only pre-approved names are matched.
+
+def action_open_app(name, wl):
+    """Launch a whitelisted app by exact name. Returns (ok, message)."""
+    valid_names = whitelisted_app_names(wl)
+    match = next((n for n in valid_names if n.lower() == name.lower()), None)
+    if not match:
+        return False, f"'{name}' isn't in the app whitelist. Allowed: {', '.join(valid_names) or '(none configured)'}"
+    if _PLATFORM == "Darwin":
+        try:
+            subprocess.run(["open", "-a", match], check=True, timeout=10)
+            return True, f"Opened {match}"
+        except Exception as e:
+            return False, f"Failed to open {match}: {e}"
+    elif _PLATFORM == "Windows":
+        try:
+            os.startfile(match)
+            return True, f"Opened {match}"
+        except Exception as e:
+            return False, f"Failed to open {match}: {e}"
+    else:
+        try:
+            subprocess.Popen([match.lower()])
+            return True, f"Opened {match}"
+        except Exception as e:
+            return False, f"Failed to open {match}: {e}"
+
+def action_set_volume(level, wl):
+    """Set system volume 0-100. Always allowed (read-safe, no whitelist needed)."""
+    try:
+        level = max(0, min(100, int(level)))
+    except (ValueError, TypeError):
+        return False, "Invalid volume level"
+    if _PLATFORM == "Darwin":
+        try:
+            subprocess.run(["osascript", "-e", f"set volume output volume {level}"],
+                           check=True, timeout=5)
+            return True, f"Volume set to {level}%"
+        except Exception as e:
+            return False, f"Failed to set volume: {e}"
+    return False, "Volume control only supported on macOS currently"
+
+def action_lock_screen(wl):
+    """Lock the screen. Always allowed — it's a safety action, not a risk."""
+    if _PLATFORM == "Darwin":
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to keystroke "q" using {control down, command down}'],
+                check=True, timeout=5)
+            return True, "Screen locked"
+        except Exception as e:
+            return False, f"Failed to lock: {e}"
+    return False, "Lock screen only supported on macOS currently"
+
+def action_run_script(name, wl):
+    """Run a whitelisted script by name. Path must exist and be in whitelist."""
+    script = find_script(wl, name)
+    if not script:
+        valid = whitelisted_script_names(wl)
+        return False, f"'{name}' isn't in the script whitelist. Allowed: {', '.join(valid) or '(none configured)'}"
+    path = script["path"]
+    if not os.path.isfile(path):
+        return False, f"Script path no longer exists: {path}"
+    try:
+        result = subprocess.run(
+            [path], capture_output=True, text=True, timeout=60, shell=False)
+        out = (result.stdout or "").strip()[-300:]  # cap output shown
+        if result.returncode == 0:
+            return True, f"Ran '{name}'" + (f" — {out}" if out else "")
+        else:
+            return False, f"'{name}' exited with code {result.returncode}" + (f": {out}" if out else "")
+    except subprocess.TimeoutExpired:
+        return False, f"'{name}' timed out after 60s"
+    except Exception as e:
+        return False, f"Failed to run '{name}': {e}"
 
 SYSTEM_CONTEXT = """You are the mission commander for Tanish Gupta's life gamification system.
 
@@ -545,6 +823,47 @@ You can perform actions by including tags in your response. Write your conversat
   Example: "Let's do a 25-min session!"
   [[START_POMODORO:25]]
 
+SYSTEM ACTIONS (only work for whitelisted apps/scripts — see WHITELIST below):
+- Open an app:        [[OPEN_APP:exact app name]]
+- Run a script:       [[RUN_SCRIPT:exact script name]]
+- Set volume:         [[SET_VOLUME:0-100]]
+- Lock the screen:    [[LOCK_SCREEN]]
+  Only use OPEN_APP / RUN_SCRIPT with names that appear EXACTLY in the WHITELIST
+  section below. If he asks for an app or script not on the list, tell him it's
+  not whitelisted and that he can add it from Settings — do NOT pretend it worked
+  and do NOT emit the tag for something off the list.
+
+KNOWLEDGE ACTIONS:
+- Re-index notes:     [[RAG_INDEX]]
+  Use when the user says they've added new notes/docs and wants to re-index.
+  The RELEVANT NOTES section at the bottom of LIVE STATUS (if present) shows
+  chunks retrieved from his indexed notes. Cite the source file when referencing them.
+  If no notes section appears, either no docs are indexed yet or the query didn't
+  match anything — don't make up answers in that case.
+- Switch persona:     [[SET_PERSONA:name]]
+  Use when the user explicitly asks to switch mode, e.g. "switch to deep work mode"
+  or "go into BRAIN research mode". Valid names come from the ACTIVE PERSONA section
+  (if shown). To clear the active persona use [[SET_PERSONA:clear]].
+  The user can also type /persona <name> directly at any time.
+  IMPORTANT: If a persona is active, you can ONLY use action tags listed under it.
+  Attempting actions outside the persona's allowlist will be blocked and shown as an
+  error — so don't try them.
+- Reload automations: [[AUTOMATION_RELOAD]]
+  Use when the user says they edited automations.json and wants it picked up live.
+  Automations fire on a schedule in the background while Kriti is running — they
+  are NOT triggered by the user talking. They can: print a nudge message, speak
+  it (if voice is on), fire action tags (gated by persona + unattended rules).
+  OPEN_APP and RUN_SCRIPT never fire in unattended mode for safety.
+- Web search:         [[WEB_SEARCH:your query here]]
+  Use when you need live or recent information that your local notes don't cover.
+  Results will appear as WEB SEARCH RESULTS in your context for the NEXT turn.
+  Web search also fires automatically when a user query contains recency signals
+  (today, latest, current, price, news, etc.) — you don't need to emit the tag
+  for those. Cite web sources as [W1], [W2] etc. Never cite a web source you
+  haven't actually seen in the WEB SEARCH RESULTS block.
+  If a persona has web search disabled, this tag will be silently skipped.
+
+
 area must be one of: Prier, BRAIN, Fitness, Academics, Habits, Wear OS
 value must be 5, 10, 15, 20, or 25
 
@@ -559,6 +878,13 @@ Examples:
 [[ADD_QUEST:Ship Prier v2|Finish OTP flow;Deploy to prod;Get 5 hirer signups|100|2026-07-15]]"
 - User: "finished the OTP flow for the prier quest" → "Tanish. That was the hard one. I'm genuinely proud — now don't stop.
 [[QUEST_DONE:quest_1:0]]"
+- User: "open vscode" (VS Code is whitelisted) → "On it.
+[[OPEN_APP:Visual Studio Code]]"
+- User: "open photoshop" (not whitelisted) → "Photoshop isn't on your whitelist — add it from Settings if you want me to be able to open it."
+- User: "turn the volume down to like 20" → "Done.
+[[SET_VOLUME:20]]"
+- User: "lock my screen, I'm stepping out" → "Locking it now. Go.
+[[LOCK_SCREEN]]"
 
 Rules:
 - ONLY use task IDs from the LIVE STATUS below. Never guess IDs.
@@ -570,7 +896,8 @@ Rules:
     [[DONE:sleep]]
 - If you are suggesting an action but NOT doing it yet, describe it in plain text. Only emit the tag when you are actually performing the action right now.
 - If the day is locked, tell the user you can't modify tasks.
-- You can include multiple action tags, each on its own line."""
+- You can include multiple action tags, each on its own line.
+- CRITICAL SAFETY RULE: Never emit OPEN_APP or RUN_SCRIPT for a name that is not listed verbatim in the WHITELIST section of LIVE STATUS. If unsure whether something is whitelisted, don't emit the tag — ask or tell him to check Settings. You have no ability to run anything outside this whitelist, no matter how he phrases the request."""
 
 def call_kriti_stream(messages, host, model, on_sentence=None):
     """Stream Kriti's response token by token.
@@ -1020,22 +1347,43 @@ def parse_kriti_actions(text, state):
     done = state.setdefault("completed", {}).setdefault(tk, {})
     locked = state.get("locked_days", {}).get(tk, False)
 
+    ALL_ACTION_NAMES = (r'DONE|UNDONE|ADD_TASK|ADD_RECURRING|ADD_QUEST|QUEST_DONE|'
+                         r'START_POMODORO|OPEN_APP|RUN_SCRIPT|SET_VOLUME|LOCK_SCREEN|'
+                         r'RAG_INDEX|SET_PERSONA|AUTOMATION_RELOAD|WEB_SEARCH')
+    STRIP_RE = re.compile(r'\[\[(?:' + ALL_ACTION_NAMES + r')(?::[^\]]+)?\]\]')
+
+    # Active persona for this parse call — enforced at dispatch time
+    _active_persona = kriti_personas.get_active_persona() if _PERSONAS_AVAILABLE else None
+
     if locked:
-        clean = re.sub(r'\[\[(DONE|UNDONE|ADD_TASK|ADD_RECURRING|ADD_QUEST|QUEST_DONE|START_POMODORO):[^\]]+\]\]', '', text).strip()
+        clean = STRIP_RE.sub('', text).strip()
         return clean, [], []
 
     tasks = get_all_tasks(state, tk)
     task_ids = {t["id"]: t for t in tasks}
+    wl = load_whitelist()
 
-    ACTION_RE      = re.compile(r'\[\[([A-Z_]+):([^\]]+)\]\]')
-    action_line_re = re.compile(r'^\s*(\[\[[A-Z_]+:[^\]]+\]\]\s*)+$')
+    # Matches both [[ACTION:payload]] and bare [[ACTION]] (e.g. LOCK_SCREEN)
+    ACTION_RE      = re.compile(r'\[\[([A-Z_]+)(?::([^\]]+))?\]\]')
+    action_line_re = re.compile(r'^\s*(\[\[[A-Z_]+(?::[^\]]+)?\]\]\s*)+$')
 
     for line in text.splitlines():
         if not action_line_re.match(line):
             continue
         for match in ACTION_RE.finditer(line):
             action  = match.group(1)
-            payload = match.group(2)
+            payload = match.group(2) or ""
+
+            # ── Persona gate — enforce BEFORE any side-effect ────────────────
+            if _PERSONAS_AVAILABLE and action != "SET_PERSONA":
+                permitted, reason = kriti_personas.action_permitted(action, _active_persona)
+                if not permitted:
+                    pname = (_active_persona or {}).get("display_name") or (_active_persona or {}).get("name", "?")
+                    confirmations.append(color(
+                        f"  ✗ [{action}] blocked by '{pname}' persona — {reason}",
+                        "red"
+                    ))
+                    continue  # skip execution entirely — NOT a crash
 
             if action == "DONE":
                 tid = payload.strip()
@@ -1120,10 +1468,121 @@ def parse_kriti_actions(text, state):
                 pending_actions.append({"type": "pomodoro", "minutes": minutes})
                 confirmations.append(color(f"  \u25cf Starting {minutes}-min Pomodoro...", "bright_green"))
 
+            elif action == "OPEN_APP":
+                ok, msg = action_open_app(payload.strip(), wl)
+                confirmations.append(color(f"  {'⏻' if ok else '✗'} {msg}", "bright_green" if ok else "red"))
+
+            elif action == "RUN_SCRIPT":
+                ok, msg = action_run_script(payload.strip(), wl)
+                confirmations.append(color(f"  {'⚙' if ok else '✗'} {msg}", "bright_green" if ok else "red"))
+
+            elif action == "SET_VOLUME":
+                ok, msg = action_set_volume(payload.strip(), wl)
+                confirmations.append(color(f"  {'🔊' if ok else '✗'} {msg}", "bright_green" if ok else "red"))
+
+            elif action == "LOCK_SCREEN":
+                ok, msg = action_lock_screen(wl)
+                confirmations.append(color(f"  {'\U0001f512' if ok else '\u2717'} {msg}", "bright_green" if ok else "red"))
+
+            elif action == "RAG_INDEX":
+                if _RAG_AVAILABLE:
+                    cfg = kriti_rag.rag_load_config()
+                    docs_dir = cfg.get("docs_dir", "")
+                    host     = state.get("ollama_host",  "http://localhost:11434")
+                    emodel   = cfg.get("embed_model", "nomic-embed-text")
+                    if not docs_dir or not os.path.isdir(docs_dir):
+                        confirmations.append(color("  ✗ RAG: docs_dir not configured — use Settings [8] → RAG", "red"))
+                    else:
+                        msgs = []
+                        try:
+                            stats = kriti_rag.rag_index(
+                                docs_dir, host, emodel,
+                                min_chars=cfg.get("min_chunk_chars", 80),
+                                max_chars=cfg.get("max_chunk_chars", 1200),
+                                progress_cb=lambda m: msgs.append(m),
+                            )
+                            confirmations.append(color(
+                                f"  ✓ RAG re-indexed: {stats['indexed']} files, "
+                                f"{stats['chunks']} chunks (skipped {stats['skipped']})",
+                                "bright_green"
+                            ))
+                        except Exception as e:
+                            confirmations.append(color(f"  ✗ RAG index error: {e}", "red"))
+                else:
+                    confirmations.append(color("  ✗ RAG module not found (kriti_rag.py missing)", "red"))
+
+            elif action == "WEB_SEARCH":
+                if _WEBSEARCH_AVAILABLE:
+                    query = payload.strip() if payload.strip() else ""
+                    if not query:
+                        confirmations.append(color("  ✗ WEB_SEARCH needs a query: [[WEB_SEARCH:your query]]", "red"))
+                    else:
+                        ws_cfg = kriti_websearch.load_config()
+                        if not ws_cfg.get("enabled", True):
+                            confirmations.append(color("  ✗ Web search is disabled in Settings", "dim"))
+                        else:
+                            try:
+                                results = kriti_websearch.web_search(
+                                    query,
+                                    max_results      = ws_cfg.get("max_results", 5),
+                                    snippet_max_chars = ws_cfg.get("snippet_max_chars", 400),
+                                    safe_search      = ws_cfg.get("safe_search", "moderate"),
+                                )
+                                if results:
+                                    confirmations.append(color(
+                                        f"  ✓ Web search: {len(results)} result(s) for \"{query[:50]}\"",
+                                        "bright_green"
+                                    ))
+                                    # Store results on state so screen_kriti can inject them
+                                    state["_web_results"] = results
+                                    state["_web_query"]   = query
+                                else:
+                                    confirmations.append(color(f"  Web search returned no results for \"{query}\"", "dim"))
+                            except Exception as e:
+                                confirmations.append(color(f"  ✗ Web search error: {e}", "red"))
+                else:
+                    confirmations.append(color("  ✗ Web search module not found (kriti_websearch.py missing)", "red"))
+
+            elif action == "SET_PERSONA":
+                if _PERSONAS_AVAILABLE:
+                    pname = payload.strip().lower()
+                    if pname in ("", "none", "off", "clear"):
+                        kriti_personas.set_active_persona(None)
+                        confirmations.append(color("  ✦ Persona cleared — back to default mode", "magenta"))
+                    else:
+                        p = kriti_personas.load_persona(pname)
+                        if p:
+                            kriti_personas.set_active_persona(pname)
+                            pdisp = p.get("display_name") or pname
+                            confirmations.append(color(f"  ✦ Persona set: {pdisp}", "magenta"))
+                        else:
+                            available = ", ".join(kriti_personas.list_personas()) or "(none)"
+                            confirmations.append(color(
+                                f"  ✗ Persona '{pname}' not found. Available: {available}",
+                                "red"
+                            ))
+                else:
+                    confirmations.append(color("  ✗ Personas module not found (kriti_personas.py missing)", "red"))
+
+            elif action == "AUTOMATION_RELOAD":
+                if _SCHEDULER_AVAILABLE:
+                    try:
+                        sched = kriti_scheduler.get_scheduler()
+                        sched.reload()
+                        jobs = sched.running_jobs()
+                        confirmations.append(color(
+                            f"  ✓ Automations reloaded — {len(jobs)} job(s): {', '.join(jobs) or '(none)'}",
+                            "bright_green"
+                        ))
+                    except Exception as e:
+                        confirmations.append(color(f"  ✗ Automation reload error: {e}", "red"))
+                else:
+                    confirmations.append(color("  ✗ Scheduler module not found", "red"))
+
     if confirmations:
         save_state(state)
 
-    clean = re.sub(r'\[\[(DONE|UNDONE|ADD_TASK|ADD_RECURRING|ADD_QUEST|QUEST_DONE|START_POMODORO):[^\]]+\]\]', '', text).strip()
+    clean = STRIP_RE.sub('', text).strip()
     return clean, confirmations, pending_actions
 
 def screen_kriti(state):
@@ -1132,6 +1591,10 @@ def screen_kriti(state):
 
     host  = state.get("ollama_host",  "http://localhost:11434")
     model = state.get("ollama_model", "gemma4")
+
+    # Bootstrap default personas on first run
+    if _PERSONAS_AVAILABLE:
+        kriti_personas.bootstrap_default_personas()
 
     # Inject live context into system prompt
     tk      = today_key()
@@ -1183,9 +1646,59 @@ LIVE STATUS ({today_key()}):
     if quest_lines:
         live_ctx += "- Active Quests:\n" + chr(10).join(quest_lines) + "\n"
 
+    # System perception — read-only snapshot of the machine
+    sys_status = get_system_status()
+    live_ctx += "\nMACHINE STATUS:\n" + format_system_status(sys_status) + "\n"
+
+    # RAG config loaded once per session (used in the per-turn retrieval below)
+    _rag_cfg   = kriti_rag.rag_load_config() if _RAG_AVAILABLE else {}
+    _rag_ready = (
+        _RAG_AVAILABLE
+        and bool(_rag_cfg.get("docs_dir"))
+        and os.path.exists(kriti_rag.RAG_DB_PATH)
+    )
+
+    # Whitelist — the ONLY apps/scripts Kriti is allowed to trigger
+    wl = load_whitelist()
+    wl_apps    = whitelisted_app_names(wl)
+    wl_scripts = whitelisted_script_names(wl)
+    live_ctx += "\nWHITELIST (only these may be opened/run — nothing else, ever):\n"
+    live_ctx += f"- Apps: {', '.join(wl_apps) if wl_apps else '(none configured)'}\n"
+    live_ctx += f"- Scripts: {', '.join(wl_scripts) if wl_scripts else '(none configured)'}\n"
+
+    # ── Persona — compose system prompt and scope RAG ──────────────────────
+    _persona      = kriti_personas.get_active_persona() if _PERSONAS_AVAILABLE else None
+    _persona_dirs = kriti_personas.persona_knowledge_dirs(_persona) if _PERSONAS_AVAILABLE else None
+    _system_prompt = (
+        kriti_personas.compose_system_prompt(KRITI_CONTEXT, _persona)
+        if _PERSONAS_AVAILABLE else KRITI_CONTEXT
+    )
+
+    # Inject persona status into live_ctx (model can see which persona is active)
+    if _PERSONAS_AVAILABLE:
+        if _persona:
+            from kriti_personas import expand_allowed_actions, ALL_KRITI_ACTIONS
+            acts = expand_allowed_actions(_persona.get("allowed_actions", ["*"]))
+            is_all = acts == set(ALL_KRITI_ACTIONS)
+            act_str = "all" if is_all else ", ".join(sorted(acts))
+            pdisp = _persona.get("display_name") or _persona.get("name", "?")
+            dirs  = _persona.get("knowledge_dirs", [])
+            dir_str = "(full index)" if not dirs else ", ".join(dirs)
+            live_ctx += (
+                f"\nACTIVE PERSONA: {pdisp}\n"
+                f"- Allowed actions: {act_str}\n"
+                f"- Knowledge scope: {dir_str}\n"
+                f"- Available personas: {', '.join(kriti_personas.list_personas())}\n"
+            )
+        else:
+            live_ctx += (
+                f"\nACTIVE PERSONA: (none — full access mode)\n"
+                f"- Available personas: {', '.join(kriti_personas.list_personas())}\n"
+            )
+
     # Load chat history for memory persistence
     past_messages = _load_chat()
-    messages = [{"role": "system", "content": KRITI_CONTEXT + live_ctx}]
+    messages = [{"role": "system", "content": _system_prompt + live_ctx}]
     if past_messages:
         # Re-inject past exchanges (skip old system messages)
         for m in past_messages:
@@ -1214,11 +1727,16 @@ LIVE STATUS ({today_key()}):
 
     clr()
     print(color("─" * 50, "dim"))
-    print(color("  KRITI", "magenta") + color("  ·  your AI", "bold") + color(f"  [{model}]", "dim"))
+    _persona_label = ""
+    if _persona:
+        pdisp = _persona.get("display_name") or _persona.get("name", "?")
+        _persona_label = color(f"  [{pdisp}]", "yellow")
+    print(color("  KRITI", "magenta") + color("  ·  your AI", "bold") + color(f"  [{model}]", "dim") + _persona_label)
     print(color(f"  ₹{fund:,} in fund  ·  ₹{earned}/{maxv} today", "dim"))
     print(color("─" * 50, "dim"))
     print(voice_status())
-    print(color("  [v] voice  [c] clear history  [q] back  or just type\n", "dim"))
+    print(color("  [v] voice  [c] clear history  [q] back  or just type", "dim"))
+    print(color("  /persona <name|clear>  to switch persona", "dim") + "\n")
 
     # Greet on entry
     if past_messages:
@@ -1270,19 +1788,59 @@ LIVE STATUS ({today_key()}):
             _save_chat([m for m in messages if m["role"] in ("user", "assistant")])
             break
         if user_input.lower() == "c":
-            messages = [{"role": "system", "content": KRITI_CONTEXT + live_ctx}]
+            messages = [{"role": "system", "content": _system_prompt + live_ctx}]
             _save_chat([])
             print(color("  ✦ Chat history cleared.", "magenta"))
             print()
             continue
+
+        # /persona command — explicit persona selection from chat
+        if user_input.lower().startswith("/persona"):
+            parts = user_input.split(None, 1)
+            arg   = parts[1].strip().lower() if len(parts) > 1 else ""
+            if _PERSONAS_AVAILABLE:
+                if arg in ("", "clear", "none", "off"):
+                    kriti_personas.set_active_persona(None)
+                    _persona      = None
+                    _persona_dirs = None
+                    _system_prompt = KRITI_CONTEXT
+                    messages[0]   = {"role": "system", "content": _system_prompt + live_ctx}
+                    print(color("  ✦ Persona cleared.", "magenta"))
+                elif arg == "list":
+                    names = kriti_personas.list_personas()
+                    if names:
+                        for n in names:
+                            p = kriti_personas.load_persona(n)
+                            marker = color(" ◀ active", "yellow") if n == kriti_personas.get_active_persona_name() else ""
+                            print(color(f"  {kriti_personas.persona_summary(p)}", "dim") + marker)
+                    else:
+                        print(color("  No personas found in ~/.life_missions/personas/", "dim"))
+                else:
+                    p = kriti_personas.load_persona(arg)
+                    if p:
+                        kriti_personas.set_active_persona(arg)
+                        _persona      = p
+                        _persona_dirs = kriti_personas.persona_knowledge_dirs(p)
+                        _system_prompt = kriti_personas.compose_system_prompt(KRITI_CONTEXT, p)
+                        messages[0]   = {"role": "system", "content": _system_prompt + live_ctx}
+                        pdisp = p.get("display_name") or arg
+                        print(color(f"  ✦ Switched to persona: {pdisp}", "magenta"))
+                    else:
+                        available = ", ".join(kriti_personas.list_personas()) or "(none)"
+                        print(color(f"  ✗ Persona '{arg}' not found. Available: {available}", "red"))
+            else:
+                print(color("  ✗ Personas module not available (kriti_personas.py missing)", "red"))
+            print()
+            continue
+
         if user_input.lower() == "v":
             if not mic_available:
                 tips = {
-                "Darwin":  "pip install pyaudio SpeechRecognition  # macOS: brew install portaudio first",
-                "Windows": "pip install pyaudio SpeechRecognition  # no extra deps needed",
-            }
-            tip = tips.get(_PLATFORM, "pip install pyaudio SpeechRecognition")
-            print(color(f"  Install pyaudio first: {tip}", "red"))
+                    "Darwin":  "pip install pyaudio SpeechRecognition  # macOS: brew install portaudio first",
+                    "Windows": "pip install pyaudio SpeechRecognition  # no extra deps needed",
+                }
+                tip = tips.get(_PLATFORM, "pip install pyaudio SpeechRecognition")
+                print(color(f"  Install pyaudio first: {tip}", "red"))
             else:
                 VOICE_ENABLED = not VOICE_ENABLED
                 status = "ON" if VOICE_ENABLED else "OFF"
@@ -1291,6 +1849,80 @@ LIVE STATUS ({today_key()}):
                 speak(msg)
             print()
             continue
+
+        # ── RAG retrieval — inject relevant notes before each Ollama call ──────
+        # Infer persona from message if none is explicitly set
+        if _PERSONAS_AVAILABLE and _persona is None:
+            inferred = kriti_personas.infer_persona(user_input)
+            if inferred:
+                _persona_dirs  = kriti_personas.persona_knowledge_dirs(inferred)
+                # Don't persist inferred persona — only affects this turn's RAG scope
+
+        if _rag_ready:
+            try:
+                rag_host   = state.get("ollama_host", "http://localhost:11434")
+                rag_emodel = _rag_cfg.get("embed_model", "nomic-embed-text")
+                rag_top_k  = _rag_cfg.get("top_k", 5)
+                rag_chunks = kriti_rag.rag_retrieve(
+                    user_input, rag_top_k, rag_host, rag_emodel,
+                    allowed_dirs=_persona_dirs,
+                )
+                if rag_chunks:
+                    rag_block = (
+                        "\nRELEVANT NOTES FROM YOUR INDEXED DOCS "
+                        "(cite the source file when referencing these):\n"
+                        + kriti_rag.rag_format_context(rag_chunks, _rag_cfg.get("docs_dir", ""))
+                        + "\n"
+                    )
+                    # Re-build system message with fresh RAG context for this turn
+                    messages[0] = {
+                        "role":    "system",
+                        "content": KRITI_CONTEXT + live_ctx + rag_block,
+                    }
+            except Exception:
+                pass  # RAG errors never block the conversation
+
+        # ── Web search grounding — inject live results when relevant ─────────
+        if _WEBSEARCH_AVAILABLE:
+            try:
+                _ws_cfg     = kriti_websearch.load_config()
+                _ws_persona = _persona if _PERSONAS_AVAILABLE else None
+
+                # Pick up explicit results stored by [[WEB_SEARCH:query]] action tag
+                _explicit_results = state.pop("_web_results", None)
+                _explicit_query   = state.pop("_web_query", "")
+
+                # Auto-trigger: recency keywords + persona allows + global enabled
+                _auto_results = None
+                if (not _explicit_results and
+                        kriti_websearch.should_search(user_input, _ws_cfg, _ws_persona)):
+                    _allowed_domains = (
+                        kriti_websearch.persona_allowed_domains(_ws_persona)
+                        if _ws_persona else []
+                    )
+                    _auto_results = kriti_websearch.web_search(
+                        user_input,
+                        max_results       = _ws_cfg.get("max_results", 5),
+                        snippet_max_chars = _ws_cfg.get("snippet_max_chars", 400),
+                        safe_search       = _ws_cfg.get("safe_search", "moderate"),
+                        allowed_domains   = _allowed_domains or None,
+                    )
+
+                _ws_results = _explicit_results or _auto_results
+                if _ws_results:
+                    _ws_block = (
+                        "\nWEB SEARCH RESULTS (live — cite [W1], [W2] etc.):\n"
+                        + kriti_websearch.format_web_results(_ws_results)
+                        + "\n"
+                    )
+                    # Merge with existing system message content
+                    _existing = messages[0]["content"]
+                    messages[0] = {
+                        "role":    "system",
+                        "content": _existing + _ws_block,
+                    }
+            except Exception:
+                pass  # web search errors never block the conversation
 
         messages.append({"role": "user", "content": user_input})
 
@@ -1420,7 +2052,7 @@ def screen_custom_tasks(state):
                 tag = color(f"[{rt['area']}]", c)
                 day_str = rt.get("days", "daily")
                 print(f"  {color(f'[{i+1}]', 'dim')} {color(rt['label'], 'bold')}  {tag}  "
-                      f"{color(f'+₹{rt["value"]}', 'bright_green')}  {color(day_str, 'dim')}")
+                      f"{color('+₹' + str(rt['value']), 'bright_green')}  {color(day_str, 'dim')}")
         print()
         print(color("  [1-N] Delete  [q] Back", "dim"))
         print()
@@ -1490,6 +2122,46 @@ def screen_quests(state):
         ch = input(color("  > ", "bright_green")).strip().lower()
         if ch == "q":
             break
+
+
+def _run_pomodoro_session(minutes, state):
+    """Run a single Pomodoro work session inline (called by Kriti via [[START_POMODORO:N]])."""
+    tk = today_key()
+    total_secs = minutes * 60
+    start = time.time()
+    print(color(f"\n  ● POMODORO  {minutes}min  —  Ctrl+C to cancel\n", "bright_green"))
+    interrupted = False
+    try:
+        while True:
+            elapsed   = int(time.time() - start)
+            remaining = total_secs - elapsed
+            if remaining <= 0:
+                break
+            mins, secs = divmod(remaining, 60)
+            bar_done = int((elapsed / total_secs) * 30)
+            bar = color("█" * bar_done, "bright_green") + color("░" * (30 - bar_done), "dim")
+            print(f"\r  [{bar}]  {mins:02d}:{secs:02d}  ", end="", flush=True)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        interrupted = True
+
+    print()
+    if not interrupted:
+        sfx("pomodoro")
+        notify("Pomodoro done!", f"{minutes}min session complete.")
+        print(color(f"\n  ✓ {minutes}min session done!", "bright_green"))
+        # Offer to mark study task
+        done = state.setdefault("completed", {}).setdefault(tk, {})
+        if not done.get("study"):
+            yn = prompt("Mark study task as done? (y/n)", "y")
+            if yn and yn.lower() == "y":
+                done["study"] = True
+                save_state(state)
+                sfx("done")
+                print(color("  ✓ Study task marked!", "bright_green"))
+    else:
+        print(color("  Session cancelled.", "dim"))
+    print()
 
 
 def screen_pomodoro(state):
@@ -1581,65 +2253,788 @@ def screen_pomodoro(state):
             pause()
 
 
-def screen_settings(state):
+def screen_whitelist(state):
+    """Manage which apps/scripts Kriti is allowed to open/run."""
+    while True:
+        wl = load_whitelist()
+        clr()
+        header(state)
+        print(color("  WHITELIST", "bold"))
+        print(color("  Kriti can ONLY open/run what's listed here. Nothing else, ever.", "dim"))
+        print()
+
+        idx_map = {}
+        i = 1
+        print(color("  Apps", "yellow"))
+        if not wl.get("apps"):
+            print(color("    (none)", "dim"))
+        for a in wl.get("apps", []):
+            print(f"  {color(f'[{i}]', 'dim')} {a['name']}")
+            idx_map[str(i)] = ("app", a)
+            i += 1
+        print()
+        print(color("  Scripts", "yellow"))
+        if not wl.get("scripts"):
+            print(color("    (none)", "dim"))
+        for s in wl.get("scripts", []):
+            exists = "✓" if os.path.isfile(s["path"]) else color("missing!", "red")
+            print(f"  {color(f'[{i}]', 'dim')} {s['name']}  {color(s['path'], 'dim')}  {exists}")
+            idx_map[str(i)] = ("script", s)
+            i += 1
+
+        print()
+        print(color("  [a] Add app  [s] Add script  [1-N] Remove  [q] Back", "dim"))
+        print()
+        ch = input(color("  > ", "bright_green")).strip().lower()
+
+        if ch == "q":
+            break
+        elif ch == "a":
+            name = prompt("Exact app name (e.g. 'Visual Studio Code')", "")
+            if name:
+                wl.setdefault("apps", []).append({"name": name})
+                save_whitelist(wl)
+                print(color(f"\n  Added '{name}' to app whitelist.", "bright_green"))
+                pause()
+        elif ch == "s":
+            name = prompt("Script nickname (e.g. 'backup_prier')", "")
+            path = prompt("Absolute path to script", "")
+            if name and path:
+                if not os.path.isfile(path):
+                    print(color(f"\n  Warning: '{path}' doesn't exist yet — added anyway.", "yellow"))
+                wl.setdefault("scripts", []).append({"name": name, "path": path})
+                save_whitelist(wl)
+                print(color(f"\n  Added '{name}' to script whitelist.", "bright_green"))
+                pause()
+        elif ch in idx_map:
+            kind, item = idx_map[ch]
+            yn = prompt(f"Remove '{item['name']}'? (y/n)", "n")
+            if yn and yn.lower() == "y":
+                if kind == "app":
+                    wl["apps"] = [a for a in wl["apps"] if a["name"] != item["name"]]
+                else:
+                    wl["scripts"] = [s for s in wl["scripts"] if s["name"] != item["name"]]
+                save_whitelist(wl)
+                print(color(f"\n  Removed.", "yellow"))
+                pause()
+
+
+def screen_system_status(state):
+    """Live read-only view of machine state, refreshable."""
+    while True:
+        clr()
+        header(state)
+        print(color("  SYSTEM STATUS", "bold"))
+        print(color("  (read-only — what Kriti can see)", "dim"))
+        print()
+        status = get_system_status()
+        print(color(format_system_status(status), "dim"))
+        print()
+        print(color("  [r] Refresh  [q] Back", "dim"))
+        print()
+        ch = input(color("  > ", "bright_green")).strip().lower()
+        if ch == "q":
+            break
+        # 'r' just loops and refreshes
+
+
+def screen_rag_settings(state):
+    """Configure and manage the local RAG / knowledge index."""
+    if not _RAG_AVAILABLE:
+        print(color("  kriti_rag.py not found — place it next to kriti.py.", "red"))
+        pause()
+        return
+
+    while True:
+        clr()
+        header(state)
+        cfg  = kriti_rag.rag_load_config()
+        stats = kriti_rag.rag_stats()
+        print(color("  RAG / KNOWLEDGE INDEX", "bold"))
+        print(color("  Ground Kriti's answers in your own notes & docs.", "dim"))
+        print()
+        print(color(f"  Docs dir:     {cfg.get('docs_dir') or '(not set)'}", "dim"))
+        print(color(f"  Embed model:  {cfg.get('embed_model', 'nomic-embed-text')}", "dim"))
+        print(color(f"  Top-K chunks: {cfg.get('top_k', 5)}", "dim"))
+        print(color(f"  Index:        {stats['files']} files · {stats['chunks']} chunks", "bright_green" if stats['chunks'] else "dim"))
+        print()
+        print(color("  [1] Set docs directory", "bold"))
+        print(color("  [2] Change embed model", "bold"))
+        print(color("  [3] Change top-K", "bold"))
+        print(color("  [4] Run incremental re-index", "bold"))
+        print(color("  [5] Force full re-index (re-embeds everything)", "bold"))
+        print(color("  [6] Clear index", "bold"))
+        print(color("  [q] Back", "dim"))
+        print()
+        ch = input(color("  > ", "bright_green")).strip().lower()
+
+        if ch == "q":
+            break
+
+        elif ch == "1":
+            d = prompt("Absolute path to docs folder", cfg.get("docs_dir", ""))
+            if d:
+                d = os.path.expanduser(d)
+                if not os.path.isdir(d):
+                    print(color(f"\n  Warning: '{d}' doesn't exist yet — saved anyway.", "yellow"))
+                cfg["docs_dir"] = d
+                kriti_rag.rag_save_config(cfg)
+                print(color("\n  Saved.", "bright_green"))
+            pause()
+
+        elif ch == "2":
+            m = prompt("Embedding model (must be pulled via ollama pull)", cfg.get("embed_model", "nomic-embed-text"))
+            if m:
+                cfg["embed_model"] = m
+                kriti_rag.rag_save_config(cfg)
+                print(color("\n  Saved. Run a re-index to apply the new model.", "bright_green"))
+            pause()
+
+        elif ch == "3":
+            k = prompt("Top-K chunks to inject per query", str(cfg.get("top_k", 5)))
+            try:
+                cfg["top_k"] = max(1, min(20, int(k)))
+                kriti_rag.rag_save_config(cfg)
+                print(color("\n  Saved.", "bright_green"))
+            except (ValueError, TypeError):
+                print(color("\n  Enter a number.", "red"))
+            pause()
+
+        elif ch in ("4", "5"):
+            docs_dir = cfg.get("docs_dir", "")
+            if not docs_dir or not os.path.isdir(docs_dir):
+                print(color("\n  Set a docs directory first ([1]).", "red"))
+                pause()
+                continue
+            host    = state.get("ollama_host",  "http://localhost:11434")
+            emodel  = cfg.get("embed_model", "nomic-embed-text")
+            force   = (ch == "5")
+            print(color(f"\n  {'Force re-indexing' if force else 'Incremental re-index'}: {docs_dir}", "dim"))
+            print(color(f"  Embed model: {emodel}", "dim"))
+            print()
+            try:
+                stats = kriti_rag.rag_index(
+                    docs_dir, host, emodel,
+                    min_chars=cfg.get("min_chunk_chars", 80),
+                    max_chars=cfg.get("max_chunk_chars", 1200),
+                    force=force,
+                    progress_cb=lambda m: print(color(m, "dim")),
+                )
+                print(color(
+                    f"\n  Done. {stats['indexed']} files indexed · {stats['chunks']} chunks · "
+                    f"{stats['skipped']} skipped · {stats['deleted']} old chunks removed.",
+                    "bright_green"
+                ))
+            except Exception as e:
+                print(color(f"\n  Error: {e}", "red"))
+                print(color("  Make sure Ollama is running and the embed model is pulled.", "dim"))
+            pause()
+
+        elif ch == "6":
+            yn = prompt("Clear the entire RAG index? This can't be undone. (y/n)", "n")
+            if yn and yn.lower() == "y":
+                kriti_rag.rag_clear_index()
+                print(color("\n  Index cleared.", "yellow"))
+            pause()
+
+
+def screen_personas(state):
+    """Browse and manage Kriti personas from Settings."""
+    if not _PERSONAS_AVAILABLE:
+        print(color("  kriti_personas.py not found — place it next to kriti.py.", "red"))
+        pause()
+        return
+
+    kriti_personas.bootstrap_default_personas()
+
+    while True:
+        clr()
+        header(state)
+        print(color("  PERSONAS", "bold"))
+        print(color("  Each persona sets tone, knowledge scope, and action permissions.", "dim"))
+        print()
+
+        names  = kriti_personas.list_personas()
+        active = kriti_personas.get_active_persona_name()
+
+        if not names:
+            print(color("  No personas found. Creating defaults...", "dim"))
+            kriti_personas.bootstrap_default_personas()
+            names = kriti_personas.list_personas()
+
+        idx_map = {}
+        for i, n in enumerate(names, 1):
+            p = kriti_personas.load_persona(n)
+            if not p:
+                continue
+            is_active = (n == active)
+            marker = color(" ◀ ACTIVE", "yellow") if is_active else ""
+            pdisp  = p.get("display_name") or n
+            dirs   = p.get("knowledge_dirs", [])
+            acts   = p.get("allowed_actions", ["*"])
+            act_str = "all actions" if "*" in acts else f"{len(acts)} actions"
+            dir_str = "full index"  if not dirs else f"{len(dirs)} dir(s)"
+            print(f"  {color(f'[{i}]', 'dim')} {color(pdisp, 'bold')}{marker}")
+            print(color(f"       {act_str}  ·  {dir_str}  ·  {len(p.get('keywords',[]))} keywords", "dim"))
+            idx_map[str(i)] = n
+        print()
+        print(color("  [1-N] View/edit  [n] New persona  [a] Set active  [c] Clear active  [q] Back", "dim"))
+        print()
+        ch = input(color("  > ", "bright_green")).strip().lower()
+
+        if ch == "q":
+            break
+
+        elif ch == "c":
+            kriti_personas.set_active_persona(None)
+            print(color("\n  Active persona cleared.", "yellow"))
+            pause()
+
+        elif ch == "a":
+            names2 = kriti_personas.list_personas()
+            for i, n in enumerate(names2, 1):
+                print(f"  {color(f'[{i}]', 'dim')} {n}")
+            raw = prompt("Enter number to activate", "")
+            if raw and raw.isdigit():
+                idx2 = int(raw) - 1
+                if 0 <= idx2 < len(names2):
+                    chosen = names2[idx2]
+                    kriti_personas.set_active_persona(chosen)
+                    p = kriti_personas.load_persona(chosen)
+                    pdisp = (p or {}).get("display_name") or chosen
+                    print(color(f"\n  ✓ Active persona set to: {pdisp}", "bright_green"))
+            pause()
+
+        elif ch == "n":
+            # Create a new blank persona
+            nm = prompt("Internal name (no spaces, e.g. 'finance_mode')", "")
+            if not nm:
+                continue
+            nm = nm.strip().lower().replace(" ", "_")
+            if kriti_personas.load_persona(nm):
+                print(color(f"\n  A persona named '{nm}' already exists.", "yellow"))
+                pause()
+                continue
+            dn  = prompt("Display name", nm.replace("_", " ").title())
+            sp  = prompt("System prompt (one line, edit file for full text)", f"You are in {dn} mode.")
+            new_p = {
+                "name":         nm,
+                "display_name": dn,
+                "system_prompt": sp,
+                "knowledge_dirs":  [],
+                "allowed_actions": ["*"],
+                "keywords":        [],
+            }
+            kriti_personas.save_persona(new_p)
+            path = os.path.join(kriti_personas.PERSONAS_DIR, f"{nm}.json")
+            print(color(f"\n  ✓ Created '{nm}'. Edit {path} for full configuration.", "bright_green"))
+            pause()
+
+        elif ch in idx_map:
+            pname = idx_map[ch]
+            _persona_detail_screen(pname, active)
+
     clr()
-    header(state)
-    print(color("  SETTINGS", "bold"))
+
+
+def _persona_detail_screen(pname: str, current_active: str | None):
+    """View / edit a single persona's fields."""
+    while True:
+        clr()
+        p = kriti_personas.load_persona(pname)
+        if not p:
+            print(color(f"  Persona '{pname}' could not be loaded.", "red"))
+            pause()
+            return
+
+        is_active = (pname == kriti_personas.get_active_persona_name())
+        pdisp = p.get("display_name") or pname
+        acts  = p.get("allowed_actions", ["*"])
+        dirs  = p.get("knowledge_dirs",  [])
+        kwds  = p.get("keywords",        [])
+
+        print(color("─" * 50, "dim"))
+        print(color(f"  PERSONA: {pdisp}", "bold") + (color("  [ACTIVE]", "yellow") if is_active else ""))
+        print()
+        print(color("  system_prompt:", "yellow"))
+        for line in textwrap.wrap(p.get("system_prompt", ""), 60):
+            print(color(f"    {line}", "dim"))
+        print()
+        print(color(f"  allowed_actions: ", "yellow") + color(
+            "all" if "*" in acts else ", ".join(acts), "dim"))
+        print(color(f"  knowledge_dirs:  ", "yellow") + color(
+            "(full index)" if not dirs else "\n    " + "\n    ".join(dirs), "dim"))
+        print(color(f"  keywords:        ", "yellow") + color(
+            ", ".join(kwds) if kwds else "(none — not auto-inferred)", "dim"))
+        print()
+        path = os.path.join(kriti_personas.PERSONAS_DIR, f"{pname}.json")
+        print(color(f"  File: {path}", "dim"))
+        print()
+        print(color("  [1] Edit display name  [2] Edit system prompt  [3] Edit allowed_actions", "bold"))
+        print(color("  [4] Edit knowledge_dirs  [5] Edit keywords  [6] Set as active  [d] Delete  [q] Back", "bold"))
+        print()
+        ch = input(color("  > ", "bright_green")).strip().lower()
+
+        if ch == "q":
+            return
+
+        elif ch == "1":
+            dn = prompt("New display name", p.get("display_name", pname))
+            if dn:
+                p["display_name"] = dn
+                kriti_personas.save_persona(p)
+                print(color("\n  Saved.", "bright_green"))
+            pause()
+
+        elif ch == "2":
+            print(color(f"\n  Current: {p.get('system_prompt','')[:100]}...", "dim"))
+            print(color("  (For long prompts, edit the JSON file directly.)", "dim"))
+            sp = prompt("New system prompt", "")
+            if sp:
+                p["system_prompt"] = sp
+                kriti_personas.save_persona(p)
+                print(color("\n  Saved.", "bright_green"))
+            pause()
+
+        elif ch == "3":
+            from kriti_personas import ALL_KRITI_ACTIONS
+            print(color(f"\n  All available actions: {', '.join(ALL_KRITI_ACTIONS)}", "dim"))
+            print(color("  Enter comma-separated action names, or * for all:", "dim"))
+            raw = prompt("allowed_actions", "*" if "*" in acts else ", ".join(acts))
+            if raw:
+                if raw.strip() == "*":
+                    p["allowed_actions"] = ["*"]
+                else:
+                    p["allowed_actions"] = [a.strip().upper() for a in raw.split(",") if a.strip()]
+                kriti_personas.save_persona(p)
+                print(color("\n  Saved.", "bright_green"))
+            pause()
+
+        elif ch == "4":
+            print(color("\n  Current dirs: " + (", ".join(dirs) or "(none — full index)"), "dim"))
+            print(color("  Enter comma-separated absolute paths, or leave blank for full index:", "dim"))
+            raw = prompt("knowledge_dirs", ", ".join(dirs))
+            if raw is not None:
+                p["knowledge_dirs"] = [d.strip() for d in raw.split(",") if d.strip()] if raw.strip() else []
+                kriti_personas.save_persona(p)
+                print(color("\n  Saved.", "bright_green"))
+            pause()
+
+        elif ch == "5":
+            print(color("\n  Enter comma-separated keywords for auto-inference (or blank for none):", "dim"))
+            raw = prompt("keywords", ", ".join(kwds))
+            if raw is not None:
+                p["keywords"] = [k.strip().lower() for k in raw.split(",") if k.strip()] if raw.strip() else []
+                kriti_personas.save_persona(p)
+                print(color("\n  Saved.", "bright_green"))
+            pause()
+
+        elif ch == "6":
+            kriti_personas.set_active_persona(pname)
+            print(color(f"\n  ✓ '{pdisp}' is now the active persona.", "bright_green"))
+            pause()
+
+        elif ch == "d":
+            yn = prompt(f"Delete persona '{pname}'? This cannot be undone. (y/n)", "n")
+            if yn and yn.lower() == "y":
+                if is_active:
+                    kriti_personas.set_active_persona(None)
+                kriti_personas.delete_persona(pname)
+                print(color(f"\n  Deleted '{pname}'.", "yellow"))
+                pause()
+                return
+
+
+def screen_websearch_settings(state):
+    """View and configure web search grounding settings."""
+    if not _WEBSEARCH_AVAILABLE:
+        print(color("  kriti_websearch.py not found.", "red"))
+        pause()
+        return
+
+    while True:
+        clr()
+        header(state)
+        print(color("  WEB SEARCH", "bold"))
+        print(color("  Live DuckDuckGo grounding — no API key, privacy-first.", "dim"))
+        print()
+
+        cfg = kriti_websearch.load_config()
+        enabled    = cfg.get("enabled", True)
+        auto       = cfg.get("auto_trigger", True)
+        max_res    = cfg.get("max_results", 5)
+        snip_chars = cfg.get("snippet_max_chars", 400)
+        safe       = cfg.get("safe_search", "moderate")
+        rate       = cfg.get("rate_limit_secs", 4.0)
+
+        print(color(f"  Enabled:          ", "yellow") + color("yes" if enabled else "no", "bright_green" if enabled else "dim"))
+        print(color(f"  Auto-trigger:     ", "yellow") + color("yes (recency keywords)" if auto else "no", "dim"))
+        print(color(f"  Max results:      ", "yellow") + color(str(max_res), "dim"))
+        print(color(f"  Snippet max chars:", "yellow") + color(str(snip_chars), "dim"))
+        print(color(f"  Safe search:      ", "yellow") + color(safe, "dim"))
+        print(color(f"  Rate limit (secs):", "yellow") + color(str(rate), "dim"))
+        print()
+        print(color("  Persona overrides: set web_search_enabled=false or web_search_domains=[...] per persona.", "dim"))
+        print()
+        print(color("  [1] Toggle enabled  [2] Toggle auto-trigger  [3] Max results", "bold"))
+        print(color("  [4] Snippet length  [5] Safe search  [6] Rate limit  [q] Back", "bold"))
+        print()
+        ch = input(color("  > ", "bright_green")).strip().lower()
+
+        if ch == "q":
+            break
+        elif ch == "1":
+            cfg["enabled"] = not enabled
+            kriti_websearch.save_config(cfg)
+            state_str = "enabled" if cfg["enabled"] else "disabled"
+            print(color(f"\n  Web search {state_str}.", "bright_green"))
+            pause()
+        elif ch == "2":
+            cfg["auto_trigger"] = not auto
+            kriti_websearch.save_config(cfg)
+            print(color(f"\n  Auto-trigger {'on' if cfg['auto_trigger'] else 'off'}.", "bright_green"))
+            pause()
+        elif ch == "3":
+            raw = prompt("Max results (1-20)", str(max_res))
+            try:
+                cfg["max_results"] = max(1, min(20, int(raw)))
+                kriti_websearch.save_config(cfg)
+                print(color(f"\n  Max results set to {cfg['max_results']}.", "bright_green"))
+            except ValueError:
+                print(color("\n  Invalid number.", "red"))
+            pause()
+        elif ch == "4":
+            raw = prompt("Snippet max chars (100-1000)", str(snip_chars))
+            try:
+                cfg["snippet_max_chars"] = max(100, min(1000, int(raw)))
+                kriti_websearch.save_config(cfg)
+                print(color(f"\n  Snippet length set to {cfg['snippet_max_chars']}.", "bright_green"))
+            except ValueError:
+                print(color("\n  Invalid number.", "red"))
+            pause()
+        elif ch == "5":
+            print(color("\n  Options: on / moderate / off", "dim"))
+            raw = prompt("Safe search", safe)
+            if raw.lower() in ("on", "moderate", "off"):
+                cfg["safe_search"] = raw.lower()
+                kriti_websearch.save_config(cfg)
+                print(color(f"\n  Safe search set to '{cfg['safe_search']}'.", "bright_green"))
+            else:
+                print(color("\n  Invalid. Choose: on / moderate / off", "red"))
+            pause()
+        elif ch == "6":
+            raw = prompt("Rate limit seconds (1-30)", str(rate))
+            try:
+                cfg["rate_limit_secs"] = max(1.0, min(30.0, float(raw)))
+                kriti_websearch.save_config(cfg)
+                print(color(f"\n  Rate limit set to {cfg['rate_limit_secs']}s.", "bright_green"))
+            except ValueError:
+                print(color("\n  Invalid number.", "red"))
+            pause()
+
+    clr()
+
+
+def screen_automations(state):
+    """View and manage scheduled automations."""
+    if not _SCHEDULER_AVAILABLE:
+        print(color("  kriti_scheduler.py not found.", "red"))
+        pause()
+        return
+
+    while True:
+        clr()
+        header(state)
+        print(color("  AUTOMATIONS", "bold"))
+        print(color("  Scheduled nudges and actions — run without you asking.", "dim"))
+        print()
+
+        autos = kriti_scheduler.load_automations()
+        sched = kriti_scheduler.get_scheduler()
+        active_jobs = sched.running_jobs()
+
+        if not autos:
+            print(color("  No automations configured.", "dim"))
+            print(color(f"  Edit: ~/.life_missions/automations.json", "dim"))
+        else:
+            for i, a in enumerate(autos, 1):
+                enabled = a.get("enabled", True)
+                aid     = a.get("id", f"auto_{i}")
+                desc    = a.get("description", aid)
+                persona = a.get("persona", "(none)")
+                trig    = a.get("trigger", {})
+                ttype   = trig.get("type", "?")
+                is_live = aid in active_jobs
+                status  = color("LIVE", "bright_green") if is_live else color("OFF ", "dim")
+                en_str  = color("enabled", "bright_green") if enabled else color("disabled", "dim")
+                print(f"  {color(f'[{i}]', 'dim')} {color(desc, 'bold')}  [{status}]  [{en_str}]")
+                print(color(f"       trigger={ttype}  persona={persona}", "dim"))
+                print(color(f"       actions={a.get('actions', [])}", "dim"))
+                print()
+
+        print(color("  [l] View run log  [r] Reload from disk  [e] Edit automations.json  [q] Back", "dim"))
+        print()
+        ch = input(color("  > ", "bright_green")).strip().lower()
+
+        if ch == "q":
+            break
+        elif ch == "l":
+            _screen_automation_log()
+        elif ch == "r":
+            sched.reload()
+            jobs = sched.running_jobs()
+            print(color(f"\n  Reloaded. {len(jobs)} job(s) active.", "bright_green"))
+            pause()
+        elif ch == "e":
+            path = kriti_scheduler.AUTOMATIONS_FILE
+            print(color(f"\n  Automations file: {path}", "dim"))
+            print(color("  Edit it in any text editor, then press [r] to reload.", "dim"))
+            if os.path.exists(path) and shutil.which("open"):
+                yn = prompt("Open in default editor? (y/n)", "y")
+                if yn and yn.lower() == "y":
+                    subprocess.Popen(["open", path])
+            pause()
+
+
+def _screen_automation_log():
+    """Show recent automation run history."""
+    clr()
+    print(color("─" * 50, "dim"))
+    print(color("  AUTOMATION RUN LOG", "bold"))
     print()
-    print(color(f"  Ollama host:  {state.get('ollama_host',  'http://localhost:11434')}", "dim"))
-    print(color(f"  Ollama model: {state.get('ollama_model', 'gemma4')}", "dim"))
-    print()
-    h = prompt("Ollama host", state.get("ollama_host", "http://localhost:11434"))
-    m = prompt("Ollama model", state.get("ollama_model", "gemma4"))
-    state["ollama_host"]  = h
-    state["ollama_model"] = m
-    save_state(state)
-    print(color("\n  Saved.", "bright_green"))
+
+    entries = kriti_scheduler.get_recent_log(30)
+    if not entries:
+        print(color("  No runs recorded yet.", "dim"))
+        pause()
+        return
+
+    for e in entries:
+        ts      = e.get("ts", "?")
+        aid     = e.get("automation_id", "?")
+        persona = e.get("persona", "(none)")
+        status  = e.get("status", "?")
+        fired   = e.get("actions_fired", [])
+        blocked = e.get("actions_blocked", [])
+        msg     = e.get("message", "")
+
+        status_color = {
+            "ok": "bright_green", "blocked": "yellow",
+            "error": "red", "skipped": "dim"
+        }.get(status, "dim")
+
+        print(color(f"  {ts}  [{aid}]", "dim") + "  " + color(status, status_color))
+        if persona:
+            print(color(f"    persona: {persona}", "dim"))
+        if msg:
+            print(color(f"    msg: {msg[:80]}", "dim"))
+        if fired:
+            print(color(f"    fired:   {', '.join(fired)}", "bright_green"))
+        if blocked:
+            print(color(f"    blocked: {', '.join(blocked)}", "yellow"))
+        if e.get("error"):
+            print(color(f"    error:   {e['error'][:120]}", "red"))
+        print()
+
     pause()
 
+
+def screen_settings(state):
+    while True:
+        clr()
+        header(state)
+        print(color("  SETTINGS", "bold"))
+        print()
+        print(color(f"  Ollama host:  {state.get('ollama_host',  'http://localhost:11434')}", "dim"))
+        print(color(f"  Ollama model: {state.get('ollama_model', 'gemma4')}", "dim"))
+        if _RAG_AVAILABLE:
+            cfg   = kriti_rag.rag_load_config()
+            st    = kriti_rag.rag_stats()
+            rline = f"{cfg.get('docs_dir') or '(not set)'}  ·  {st['files']} files / {st['chunks']} chunks"
+            print(color(f"  RAG index:    {rline}", "dim"))
+        if _PERSONAS_AVAILABLE:
+            active_pname = kriti_personas.get_active_persona_name()
+            pdisp = f" (active: {active_pname})" if active_pname else ""
+            print(color(f"  Persona:{pdisp}", "dim"))
+        print()
+        print(color("  [1] Edit Ollama host/model", "bold"))
+        print(color("  [2] Manage whitelist (apps & scripts Kriti can trigger)", "bold"))
+        print(color("  [3] View system status", "bold"))
+        if _RAG_AVAILABLE:
+            print(color("  [4] RAG / Knowledge index", "bold"))
+        if _PERSONAS_AVAILABLE:
+            active_pname = kriti_personas.get_active_persona_name()
+            persona_hint = color(f" (active: {active_pname})", "yellow") if active_pname else ""
+            print(color("  [5] Personas", "bold") + persona_hint)
+        if _SCHEDULER_AVAILABLE:
+            print(color("  [6] Automations", "bold"))
+        if _WEBSEARCH_AVAILABLE:
+            ws_cfg = kriti_websearch.load_config()
+            ws_status = color("on", "bright_green") if ws_cfg.get("enabled") else color("off", "dim")
+            print(color("  [7] Web search", "bold") + color(f" ({ws_status})", "dim"))
+        print(color("  [q] Back", "dim"))
+        print()
+        ch = input(color("  > ", "bright_green")).strip().lower()
+
+        if ch == "q":
+            break
+        elif ch == "1":
+            h = prompt("Ollama host", state.get("ollama_host", "http://localhost:11434"))
+            m = prompt("Ollama model", state.get("ollama_model", "gemma4"))
+            state["ollama_host"]  = h
+            state["ollama_model"] = m
+            save_state(state)
+            print(color("\n  Saved.", "bright_green"))
+            pause()
+        elif ch == "2":
+            screen_whitelist(state)
+        elif ch == "3":
+            screen_system_status(state)
+        elif ch == "4" and _RAG_AVAILABLE:
+            screen_rag_settings(state)
+        elif ch == "5" and _PERSONAS_AVAILABLE:
+            screen_personas(state)
+        elif ch == "6" and _SCHEDULER_AVAILABLE:
+            screen_automations(state)
+        elif ch == "7" and _WEBSEARCH_AVAILABLE:
+            screen_websearch_settings(state)
+
+
 # ── Main menu ─────────────────────────────────────────────────────────────────
+
+
+def _make_execute_tag_adapter():
+    """Thin execute_tag(action, payload, state, wl) for the scheduler background runner."""
+    def _execute_tag(action: str, payload: str, state: dict, wl: dict) -> str:
+        tk       = today_key()
+        done     = state.setdefault("completed", {}).setdefault(tk, {})
+        tasks    = get_all_tasks(state, tk)
+        task_ids = {t["id"]: t for t in tasks}
+        real_wl  = load_whitelist()
+
+        if action == "DONE":
+            tid = payload.strip()
+            if tid in task_ids:
+                done[tid] = True
+                t = task_ids[tid]
+                return f"Marked '{t['label']}' done"
+            return f"Task '{tid}' not found"
+
+        elif action == "UNDONE":
+            tid = payload.strip()
+            if tid in task_ids:
+                done[tid] = False
+                return f"Unmarked '{task_ids[tid]['label']}'"
+            return f"Task '{tid}' not found"
+
+        elif action == "ADD_TASK":
+            parts = payload.split("|")
+            if len(parts) >= 3:
+                label, area = parts[0].strip(), parts[1].strip()
+                try:
+                    value = int(parts[2].strip())
+                except ValueError:
+                    value = 10
+                clist = state.setdefault("custom_tasks", {}).setdefault(tk, [])
+                cid   = f"custom_{len(clist)+1}"
+                clist.append({"id": cid, "label": label, "area": area, "value": value})
+                return f"Added task '{label}'"
+            return "ADD_TASK: bad payload"
+
+        elif action == "RAG_INDEX":
+            if _RAG_AVAILABLE:
+                cfg      = kriti_rag.rag_load_config()
+                docs_dir = cfg.get("docs_dir", "")
+                host     = state.get("ollama_host", "http://localhost:11434")
+                emodel   = cfg.get("embed_model", "nomic-embed-text")
+                if docs_dir and os.path.isdir(docs_dir):
+                    stats = kriti_rag.rag_index(docs_dir, host, emodel)
+                    return f"RAG indexed {stats['indexed']} files, {stats['chunks']} chunks"
+                return "RAG: docs_dir not configured"
+            return "RAG module not available"
+
+        elif action == "SET_VOLUME":
+            ok, msg = action_set_volume(payload.strip(), real_wl)
+            return msg
+
+        elif action == "LOCK_SCREEN":
+            ok, msg = action_lock_screen(real_wl)
+            return msg
+
+        return f"[{action}] not handled by scheduler adapter"
+
+    return _execute_tag
+
 
 def main():
     state = load_state()
     if "wishlist" not in state:
         state["wishlist"] = WISHLIST
 
-    while True:
-        clr()
-        header(state)
-        streak = _calc_streak(state)
-        streak_str = color(f"  🔥 {streak}-day streak", "bright_green") if streak > 0 else ""
-        if streak_str:
-            print(streak_str)
-            print()
-        print(color("  [1] Missions",  "bold"))
-        print(color("  [2] Wishlist",  "bold"))
-        print(color("  [3] History",   "bold"))
-        print(color("  [4] Quests",    "bold"))
-        print(color("  [5] Pomodoro",  "bold"))
-        print(color("  [6] My Tasks",  "bold"))
-        print(color("  [7] Kriti",     "magenta"))
-        print(color("  [8] Settings",  "dim"))
-        print(color("  [q] Quit",      "dim"))
-        print()
-        ch = input(color("  > ", "bright_green")).strip().lower()
+    # Start in-process scheduler
+    if _SCHEDULER_AVAILABLE:
+        sched = kriti_scheduler.get_scheduler()
+        sched.configure(
+            state_loader         = load_state,
+            state_saver          = save_state,
+            notify_fn            = notify,
+            speak_fn             = speak,
+            output_fn            = print,
+            persona_gate         = (
+                kriti_personas.action_permitted
+                if _PERSONAS_AVAILABLE else (lambda a, p: (True, ""))
+            ),
+            get_persona          = (
+                kriti_personas.load_persona
+                if _PERSONAS_AVAILABLE else (lambda n: None)
+            ),
+            execute_tag          = _make_execute_tag_adapter(),
+            get_system_status_fn = get_system_status,
+        )
+        sched.start()
 
-        if   ch == "1": screen_missions(state)
-        elif ch == "2": screen_wishlist(state)
-        elif ch == "3": screen_history(state)
-        elif ch == "4": screen_quests(state)
-        elif ch == "5": screen_pomodoro(state)
-        elif ch == "6": screen_custom_tasks(state)
-        elif ch == "7": screen_kriti(state)
-        elif ch == "8": screen_settings(state)
-        elif ch == "q": break
+    try:
+        while True:
+            clr()
+            header(state)
+            streak = _calc_streak(state)
+            streak_str = color(f"  {chr(128293)} {streak}-day streak", "bright_green") if streak > 0 else ""
+            if streak_str:
+                print(streak_str)
+                print()
+            print(color("  [1] Missions",  "bold"))
+            print(color("  [2] Wishlist",  "bold"))
+            print(color("  [3] History",   "bold"))
+            print(color("  [4] Quests",    "bold"))
+            print(color("  [5] Pomodoro",  "bold"))
+            print(color("  [6] My Tasks",  "bold"))
+            print(color("  [7] Kriti",     "magenta"))
+            print(color("  [8] Settings",  "dim"))
+            print(color("  [q] Quit",      "dim"))
+            print()
+            ch = input(color("  > ", "bright_green")).strip().lower()
+
+            if   ch == "1": screen_missions(state)
+            elif ch == "2": screen_wishlist(state)
+            elif ch == "3": screen_history(state)
+            elif ch == "4": screen_quests(state)
+            elif ch == "5": screen_pomodoro(state)
+            elif ch == "6": screen_custom_tasks(state)
+            elif ch == "7": screen_kriti(state)
+            elif ch == "8": screen_settings(state)
+            elif ch == "q": break
+    finally:
+        if _SCHEDULER_AVAILABLE:
+            kriti_scheduler.get_scheduler().stop()
 
     clr()
     print(color("  See you tomorrow.\n", "dim"))
+
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(color("\n\n  Ctrl+C — bye.\n", "dim"))
+        print(color("\n\n  Ctrl+C -- bye.\n", "dim"))
         sys.exit(0)
+
