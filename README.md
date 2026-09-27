@@ -59,7 +59,8 @@ She can also open/close/focus apps, search and open whitelisted files, read/writ
  ✦ web search    optional live grounding, gated per-persona, rate-limited, cited as [W1] [W2]
  ✦ wake word     always-on voice — say the wake phrase from anywhere, no need to be in the chat screen
  ✦ screen sight  local vision model describes what's on your screen, on request
- ✦ live avatar    her portrait pinned above the chat — blinks, talks, glows by state
+ ✦ live avatar    animated portrait pinned above the chat — breathes, blinks, talks,
+                  reacts (thinking, listening, happy ^^ on wins, worried on errors)
  ✦ barge-in       cut her off mid-sentence: any key, or just start talking
  ✦ memory         remembers lasting facts across weeks — /memory, /forget N
  ✦ tool calling   native Ollama tools for actions, with automatic [[TAG]] fallback
@@ -99,8 +100,8 @@ pip install ddgs
 pip install openwakeword pyaudio numpy
 python3 -c "import openwakeword; openwakeword.utils.download_models()"
 
-# screen awareness + Kriti's on-screen avatar (optional)
-pip install Pillow
+# screen awareness + Kriti's animated avatar (optional)
+pip install Pillow numpy
 ollama pull moondream    # or llava — a vision-capable model, separate from your main chat model
 ```
 
@@ -162,7 +163,18 @@ Kriti knows your active projects, your fund, every task's status, your quests, a
 | `/persona deep_work` or `[[SET_PERSONA:deep_work]]` | switches active persona mid-chat |
 | anything with `"latest"`, `"current"`, `"today"`, etc. | auto-triggers a live web search (if the active persona allows it) |
 
-**live avatar** — in a terminal of at least ~62×24 (truecolor recommended), the chat screen pins Kriti's portrait and a status panel to the top while the conversation scrolls underneath. Her frame shows what she's doing: pink = online, blue = listening, purple (slow pulse) = thinking, green (fast pulse) = speaking, red = something went wrong. Smaller terminals fall back to the plain header. Needs `Pillow`.
+**live avatar** — in a terminal of at least ~62×24 (truecolor recommended), the chat screen pins an animated Kriti and a status panel to the top while the conversation scrolls underneath. She grows with your terminal (up to 50 columns) and every frame is generated live from `assets/kriti.png` — no sprite files:
+
+| state | what you see |
+|---|---|
+| online | breathing, blinking, sakura petals drifting down the edges |
+| thinking | half-lidded "hmm" face, a scan line sweeping down, purple pulse |
+| listening | headphones glow cyan |
+| speaking | mouth moving between shapes, green pulse |
+| happy | `^^` face, a little bounce and sparkles — when you finish a task, milestone or pomodoro |
+| alert | worried face with a sweat drop, red frame — when something fails |
+
+Only changed cells are redrawn (~20–25 KB/s idle). Smaller terminals fall back to the plain header. Needs `Pillow` and `numpy`.
 
 **interrupting her** — press any key while she's replying to stop her (generation and speech both stop, and any actions in the cut-off reply are *not* run). In voice mode you can also just start talking over her; that works best with headphones, since on laptop speakers the mic can hear her own voice.
 

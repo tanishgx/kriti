@@ -1101,18 +1101,19 @@ class TestMemory(unittest.TestCase):
 
 
 class TestAvatar(unittest.TestCase):
-    """kriti_avatar: every rendered line has the same visible width."""
+    """kriti_avatar: layout of the rendered portrait and HUD sizing."""
 
     def setUp(self):
         import kriti_avatar
+        import numpy as np
         self.av = kriti_avatar
-        # PIL is stubbed above, so feed render() a fake 20×(3 rows) pixel grid
-        # instead of decoding the real PNG.
-        grid = [[((1, 2, 3), (4, 5, 6))] * 20 for _ in range(3)]
-        p1 = patch.dict(kriti_avatar._cache, {(20, v): grid for v in kriti_avatar.VARIANTS})
-        p2 = patch.object(kriti_avatar, "available", return_value=True)
-        p1.start(); p2.start()
-        self.addCleanup(p1.stop); self.addCleanup(p2.stop)
+        # PIL/numpy image work is stubbed out: feed render() a fake 20×6 pixel frame.
+        frame = np.full((6, 20, 3), 100, dtype=np.uint8)
+        for p in (patch.object(kriti_avatar, "pixels", return_value=frame),
+                  patch.object(kriti_avatar, "_height_for", return_value=6),
+                  patch.object(kriti_avatar, "available", return_value=True)):
+            p.start()
+            self.addCleanup(p.stop)
 
     def _visible(self, line):
         import re
@@ -1121,7 +1122,6 @@ class TestAvatar(unittest.TestCase):
     def test_framed_lines_uniform_width(self):
         for st in list(self.av.STATES) + ["unknown"]:
             lines = self.av.render(width=20, state=st)
-            self.assertTrue(lines)
             self.assertEqual({self._visible(l) for l in lines}, {22})
             self.assertEqual(len(lines), 5)  # 3 pixel rows + top/bottom frame
 
@@ -1129,23 +1129,39 @@ class TestAvatar(unittest.TestCase):
         out = self.av.side_by_side(["AB"], ["x", "y"], avatar_width=2, gap=1)
         self.assertEqual(out, ["AB x", "   y"])
 
+    def test_unavailable_renders_nothing(self):
+        with patch.object(self.av, "available", return_value=False):
+            self.assertEqual(self.av.render(width=20), [])
+
+    def test_body_lines_skip_repeated_colours(self):
+        import numpy as np
+        lines = self.av.body_lines(np.zeros((2, 5, 3), dtype=np.uint8))
+        self.assertEqual(lines[0].count("\x1b[38"), 1)   # one fg code for 5 same-colour cells
+        self.assertEqual(self._visible(lines[0]), 5)
+
+    def test_overlay_draws_inside_bounds_only(self):
+        import numpy as np
+        px = np.zeros((6, 8, 3), dtype=np.uint8)
+        out = self.av.overlay(px, (255, 0, 0), scan=2, petals=[(-1, -1), (5, 7)], sparkles=[(0, 0)])
+        self.assertEqual(out.shape, px.shape)
+        self.assertGreater(out[2].sum(), 0)
+        self.assertEqual(px.sum(), 0)   # input untouched
+
     def test_fit_width_shrinks_then_gives_up(self):
-        self.assertEqual(self.av.fit_width(120, 40), 34)
-        small = self.av.fit_width(80, 24)
-        self.assertIsNotNone(small)
-        self.assertLess(small, 34)
-        self.assertIsNone(self.av.fit_width(60, 20))
+        with patch.object(self.av, "_height_for", side_effect=lambda w: round(280 * w / 230 / 2) * 2):
+            self.assertEqual(self.av.fit_width(140, 50), 50)
+            small = self.av.fit_width(80, 24)
+            self.assertIsNotNone(small)
+            self.assertLess(small, 34)
+            self.assertIsNone(self.av.fit_width(60, 20))
 
     def test_hud_refuses_non_tty(self):
         import io
         hud = self.av.HUD(lambda h, w: [], out=io.StringIO())
         self.assertFalse(hud.start())
         hud.set_state("thinking")   # no-op, must not raise
+        hud.celebrate()
         hud.stop()
-
-    def test_unavailable_renders_nothing(self):
-        with patch.object(self.av, "available", return_value=False):
-            self.assertEqual(self.av.render(width=20), [])
 
 
 if __name__ == "__main__":

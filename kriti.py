@@ -165,6 +165,15 @@ def hud_state(name):
         _hud.set_state(name)
 
 
+def hud_celebrate(confirmations=None):
+    """Flash her happy face — always if called bare, or if any confirmation is a win
+    (task done ✓ / milestone ✓ / quest complete ★). No-op without a HUD."""
+    if _hud is None:
+        return
+    if confirmations is None or any(("\u2713" in c or "\u2605" in c) for c in confirmations):
+        _hud.celebrate()
+
+
 def _confirm_action(action, payload):
     """Ask before a sensitive action on a turn that saw web/screen content."""
     hud_state("alert")
@@ -1792,6 +1801,7 @@ def _on_wake_detected():
             hud_state("thinking")
             clean_reply, confirmations = run_kriti_turn_headless(state, query, speak_reply=True)
             hud_state("idle")
+            hud_celebrate(confirmations)
         show([color("  you 🎙 › ", "cyan") + color(query, "bold"),
               "",
               color("  kriti › ", "magenta") + clean_reply]
@@ -2102,6 +2112,7 @@ def screen_kriti(state):
                     print()
                     for a in actions:
                         print(a)
+                    hud_celebrate(actions)
 
                 hud_state("idle")
 
@@ -2364,6 +2375,7 @@ def _run_pomodoro_session(minutes, state):
         sfx("pomodoro")
         notify("Pomodoro done!", f"{minutes}min session complete.")
         print(color(f"\n  ✓ {minutes}min session done!", "bright_green"))
+        hud_celebrate()
         # Offer to mark study task
         done = state.setdefault("completed", {}).setdefault(tk, {})
         if not done.get("study"):
