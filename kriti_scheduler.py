@@ -28,11 +28,14 @@ Whitelisting / permission gate:
 
 Unattended run philosophy (explicit decision, logged here):
   Actions that are "always safe" (SET_VOLUME, LOCK_SCREEN, RAG_INDEX, DONE,
-  UNDONE, ADD_TASK, ADD_RECURRING, ADD_QUEST, QUEST_DONE, START_POMODORO) will
-  fire unattended IF they are in the persona's allowlist.
-  Actions that open apps (OPEN_APP) or run scripts (RUN_SCRIPT) are gated at the
+  UNDONE, ADD_TASK, ADD_RECURRING, ADD_QUEST, QUEST_DONE, START_POMODORO,
+  LIST_APPS, FILE_SEARCH, CLIPBOARD_READ, CLIPBOARD_WRITE, OPEN_URL,
+  DESCRIBE_SCREEN) will fire unattended IF they are in the persona's allowlist.
+  Actions that open/close/focus apps, run scripts, or open a local file
+  (OPEN_APP, CLOSE_APP, FOCUS_WINDOW, RUN_SCRIPT, FILE_OPEN) are gated at the
   UNATTENDED_BLOCKED set below — they will be SKIPPED with a clear log entry
-  because a human is not present to verify the target launched correctly.
+  because a human is not present to verify the target launched correctly, or
+  to notice if closing/focusing the wrong thing interrupted something.
   This is deliberately more conservative than manual invocation.
 """
 
@@ -58,7 +61,13 @@ AUTOMATIONS_FILE  = os.path.join(SAVE_DIR, "automations.json")
 RUN_LOG_FILE      = os.path.join(SAVE_DIR, "automation_log.json")
 
 # Actions that will NOT fire in unattended/scheduled mode (requires human present)
-UNATTENDED_BLOCKED = {"OPEN_APP", "RUN_SCRIPT"}
+UNATTENDED_BLOCKED = {"OPEN_APP", "RUN_SCRIPT", "CLOSE_APP", "FOCUS_WINDOW", "FILE_OPEN"}
+
+# Perception checks beyond battery/cpu/ram — see PERCEPTION_CHECKS below.
+# idle_above:         value = seconds idle (needs get_system_status()["idle_secs"])
+# foreground_app_is:  value = substring, case-insensitive, matched against
+#                      get_system_status()["foreground_app"]
+# foreground_app_not: same, inverted — fires when NOT on that app
 
 # How often perception-based triggers are polled (seconds)
 PERCEPTION_POLL_SECS = 120
@@ -84,6 +93,32 @@ DEFAULT_AUTOMATIONS: list[dict] = [
             "Good morning, Tanish. It's 9am — deep work window is open. "
             "Prier or BRAIN? Pick one and lock in for 90 minutes."
         ),
+    },
+    {
+        "id":          "idle_auto_lock",
+        "enabled":     False,   # opinionated behavior change — opt in yourself
+        "description": "Lock the screen after being idle for a while (away from desk)",
+        "trigger": {
+            "type":  "perception",
+            "check": "idle_above",
+            "value": 900,   # 15 minutes — edit to taste
+        },
+        "persona":  None,   # runs under no persona = full allowlist
+        "actions":  ["[[LOCK_SCREEN]]"],
+        "message":  "",   # no nudge text — it just locks, silently
+    },
+    {
+        "id":          "morning_briefing",
+        "enabled":     True,
+        "description": "Morning spoken briefing — tasks, quests, calendar, day priorities",
+        "trigger": {
+            "type":   "cron",
+            "hour":   8,
+            "minute": 30,
+        },
+        "persona":  None,
+        "actions":  ["[[BRIEFING]]"],
+        "message":  "",   # briefing speaks for itself
     },
 ]
 
@@ -188,6 +223,11 @@ def run_automation(
     msg_text    = auto.get("message", "")
     action_tags = auto.get("actions", [])  # e.g. ["[[DONE:workout]]"]
     import re
+    try:
+        import kriti_tracker as _tracker
+        _tracker.log_event("automation", f"{auto_id} fired")
+    except Exception:
+        pass
     TAG_RE = re.compile(r'\[\[([A-Z_]+)(?::([^\]]+))?\]\]')
 
     attempted = []
@@ -266,6 +306,17 @@ PERCEPTION_CHECKS = {
     ),
     "ram_above": lambda status, value: (
         status.get("ram_pct") is not None and status["ram_pct"] > int(value)
+    ),
+    "idle_above": lambda status, value: (
+        status.get("idle_secs") is not None and status["idle_secs"] > int(value)
+    ),
+    "foreground_app_is": lambda status, value: (
+        bool(status.get("foreground_app"))
+        and str(value).lower() in status["foreground_app"].lower()
+    ),
+    "foreground_app_not": lambda status, value: (
+        bool(status.get("foreground_app"))
+        and str(value).lower() not in status["foreground_app"].lower()
     ),
 }
 

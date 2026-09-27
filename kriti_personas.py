@@ -38,6 +38,13 @@ ALL_KRITI_ACTIONS = [
     "ADD_QUEST", "QUEST_DONE", "START_POMODORO",
     "OPEN_APP", "RUN_SCRIPT", "SET_VOLUME", "LOCK_SCREEN",
     "RAG_INDEX", "SET_PERSONA",
+    # Jarvis-tier additions
+    "SPOTIFY", "BRIEFING", "CALENDAR_REFRESH",
+    # System control / perception — must be listed here or a "*" persona
+    # (e.g. general) silently blocks them.
+    "CLOSE_APP", "LIST_APPS", "FOCUS_WINDOW", "FILE_SEARCH", "FILE_OPEN",
+    "CLIPBOARD_READ", "CLIPBOARD_WRITE", "OPEN_URL", "DESCRIBE_SCREEN",
+    "WEB_SEARCH", "AUTOMATION_RELOAD", "REMEMBER",
 ]
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -264,6 +271,7 @@ DEFAULT_PERSONAS = [
             "DONE", "UNDONE", "ADD_TASK", "ADD_RECURRING",
             "ADD_QUEST", "QUEST_DONE", "START_POMODORO",
             "OPEN_APP", "RUN_SCRIPT", "SET_VOLUME", "RAG_INDEX",
+            "BRIEFING", "CALENDAR_REFRESH",
         ],
         "keywords": [
             "code", "coding", "prier", "brain", "alpha", "debug",
